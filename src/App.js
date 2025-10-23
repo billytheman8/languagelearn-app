@@ -6,7 +6,19 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState(null);
   const [segments, setSegments] = useState([]);
   const [loading, setLoading] = useState(false);
+
+  // NEW: playback state
+  const [isPlayingAll, setIsPlayingAll] = useState(false);
+  const [currentIndex, setCurrentIndex] = useState(-1);
+
   const audioRef = useRef(null);
+
+  const ensureAudio = () => {
+    if (!audioRef.current && audioUrl) {
+      audioRef.current = new Audio(audioUrl);
+    }
+    return audioRef.current;
+  };
 
   const handleFileChange = (e) => {
     const f = e.target.files && e.target.files[0];
@@ -22,10 +34,15 @@ export default function App() {
     setFile(null);
     setAudioUrl(null);
     setSegments([]);
+    setIsPlayingAll(false);
+    setCurrentIndex(-1);
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current = null;
     }
+    // Stop any ongoing speech
+    window.speechSynthesis.cancel();
   };
 
   const transcribe = async () => {
@@ -34,7 +51,8 @@ export default function App() {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      const resp = await axios.post('https://languagelearn-server.onrender.com/api/transcribe', fd, {
+      // ⬇️ KEEP your existing URL here (localhost OR your Render URL)
+      const resp = await axios.post('https://listenlanguage.netlify.app/', fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       setSegments(resp.data.segments || []);
@@ -46,12 +64,17 @@ export default function App() {
     }
   };
 
+  // Existing single-segment play (kept for manual use)
   const playSegment = (i) => {
     const seg = segments[i];
-    if (!audioRef.current) {
-      audioRef.current = new Audio(audioUrl);
-    }
-    const a = audioRef.current;
+    if (!seg) return;
+    const a = ensureAudio();
+    if (!a) return;
+
+    // Stop any ongoing full play
+    setIsPlayingAll(false);
+    window.speechSynthesis.cancel();
+
     a.currentTime = Math.max(0, seg.start - 0.05);
     a.play();
 
@@ -66,6 +89,76 @@ export default function App() {
     };
     a.addEventListener('timeupdate', onTime);
   };
+
+  // ---------- NEW: Continuous playback helpers ----------
+  const waitForAudioSegment = (seg) => {
+    return new Promise((resolve) => {
+      const a = ensureAudio();
+      if (!a) return resolve();
+
+      // Seek slightly before segment start for smoothness
+      a.currentTime = Math.max(0, seg.start - 0.05);
+      a.play();
+
+      const onTime = () => {
+        if (a.currentTime >= seg.end - 0.02) {
+          a.pause();
+          a.removeEventListener('timeupdate', onTime);
+          resolve();
+        }
+      };
+      a.addEventListener('timeupdate', onTime);
+    });
+  };
+
+  const speakTranslation = (text) => {
+    return new Promise((resolve) => {
+      // Cancel any queued speech before speaking the next translation
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      // NOTE: This is the browser voice. We can map voices to languages later.
+      utter.lang = 'en-US';
+      utter.onend = resolve;
+      utter.onerror = resolve;
+      speechSynthesis.speak(utter);
+    });
+  };
+
+  const stopAll = () => {
+    setIsPlayingAll(false);
+    setCurrentIndex(-1);
+    const a = audioRef.current;
+    if (a) {
+      a.pause();
+    }
+    window.speechSynthesis.cancel();
+  };
+
+  const playAll = async () => {
+    if (!segments.length) return;
+    // Clicking this button is a "user gesture", which allows audio to autoplay.
+    setIsPlayingAll(true);
+    const a = ensureAudio();
+    if (!a) return;
+
+    for (let i = 0; i < segments.length; i++) {
+      if (!isPlayingAll && i > 0) break; // if stopped mid-run
+      setCurrentIndex(i);
+
+      // 1) Play Danish segment
+      await waitForAudioSegment(segments[i]);
+      if (!isPlayingAll) break;
+
+      // 2) Speak English translation
+      await speakTranslation(segments[i].translation);
+      if (!isPlayingAll) break;
+    }
+
+    // Done
+    setIsPlayingAll(false);
+    setCurrentIndex(-1);
+  };
+  // ------------------------------------------------------
 
   return (
     <div style={{ padding: 24, fontFamily: 'sans-serif' }}>
@@ -103,13 +196,29 @@ export default function App() {
       {segments.length > 0 && (
         <div style={{ marginTop: 16, padding: 12, border: '1px solid #eee', borderRadius: 8 }}>
           <h2>Segments</h2>
+
+          {/* NEW: Full-lesson controls */}
+          <div style={{ marginBottom: 12 }}>
+            <button onClick={playAll} disabled={isPlayingAll} style={{ marginRight: 8 }}>
+              ▶️ Play full lesson (Danish → English)
+            </button>
+            <button onClick={stopAll} disabled={!isPlayingAll}>
+              ⏹ Stop
+            </button>
+            {currentIndex >= 0 && (
+              <span style={{ marginLeft: 12, color: '#666' }}>
+                Now playing segment {currentIndex + 1} / {segments.length}
+              </span>
+            )}
+          </div>
+
           <ol>
             {segments.map((s, i) => (
               <li key={i} style={{ marginBottom: 12 }}>
                 <div><strong>Original:</strong> {s.original}</div>
                 <div><strong>Translation:</strong> {s.translation}</div>
                 <button onClick={() => playSegment(i)} style={{ marginTop: 6 }}>
-                  Play segment → Speak translation
+                  ▶️ Play this segment only
                 </button>
               </li>
             ))}
